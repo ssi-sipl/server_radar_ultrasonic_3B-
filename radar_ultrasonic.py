@@ -5,6 +5,7 @@ import time
 import serial
 import threading
 import logging
+import pigpio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -12,10 +13,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # GPIO Configuration
 GPIO.setmode(GPIO.BOARD)
 
-TRIG_PIN = 23  # Hardcoded GPIO pin for trigger
-ECHO_PIN = 24  # Hardcoded GPIO pin for echo
-GPIO.setup(TRIG_PIN, GPIO.OUT)
-GPIO.setup(ECHO_PIN, GPIO.IN)
+ULTRASONIC_SENSORS = [                      # Hardcoded GPIO pin for trigger and echo for each ultrasonic sensor
+    {"id": "US1", "trig": 23, "echo": 24},
+    {"id": "US2", "trig": 15, "echo": 13},
+]
+
+for sensor in ULTRASONIC_SENSORS:
+    GPIO.setup(sensor["trig"], GPIO.OUT)
+    GPIO.setup(sensor["echo"], GPIO.IN)
 
 # Radar sensor serial communication setup
 RADAR_PORT = '/dev/ttyS0'  # Hardcoded serial port for radar sensor
@@ -38,20 +43,20 @@ def send_http_command(url, method='POST', params=None, data=None, headers=None):
         print(f"Error: {e}")
         return None
 
-def measure_distance_ultrasonic():
-    GPIO.output(TRIG_PIN, GPIO.HIGH)
+def measure_distance_ultrasonic(trig, echo):
+    GPIO.output(trig, GPIO.HIGH)
     time.sleep(0.00001)  # 10 microseconds
-    GPIO.output(TRIG_PIN, GPIO.LOW)
+    GPIO.output(trig, GPIO.LOW)
 
     pulse_start = time.time()
     timeout_start = pulse_start
 
-    while GPIO.input(ECHO_PIN) == 0:
+    while GPIO.input(echo) == 0:
         pulse_start = time.time()
         if pulse_start - timeout_start > 0.02:  # Timeout for no echo received
             return -1
 
-    while GPIO.input(ECHO_PIN) == 1:
+    while GPIO.input(echo) == 1:
         pulse_end = time.time()
         if pulse_end - pulse_start > 0.02:  # Timeout for long echo
             return -1
@@ -66,69 +71,115 @@ def measure_distance_ultrasonic():
 
 # Function to read from the radar sensor (UART)
 def read_from_port(ser):
+    buffer = ""
     try:
         while True:
             if ser.in_waiting > 0:
-                data = ser.read(ser.in_waiting)  # Read all data available in the buffer
-                decoded_data = data.decode('utf-8', errors='ignore').strip()  # Decode and strip extra spaces/newlines
-                
-                # Extract numeric values from the string using regular expression
-                numeric_values = ''.join(filter(str.isdigit, decoded_data))  # Find all numeric digits
+                data = ser.read(ser.in_waiting)
+                # Decode incoming bytes
+                decoded = data.decode("utf-8", errors="ignore")
+                buffer += decoded                
+                # Process complete lines only
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    # Strict numeric check
+                    if line.isdigit():
+                        distance = int(line)
+                        if 10 <= distance <= 780:
+                            logging.info(f"RADAR_1 |Radar Sensor Value: {distance} cm")
+                            check_and_send_request(distance, "RADAR_1", "Hardware_UART")
+                        else:
+                            logging.info(f"Distance {distance:.2f} cm is out of the valid range (10 - 780 cm).")
 
-                if numeric_values:
-                    logging.info(f"Radar Sensor Value: {numeric_values} cm")
-                    try:
-                        distance_radar = float(numeric_values)  # Convert value to float
-                        check_and_send_request(distance_radar)  # Call the function to check and send request
-                    except ValueError:
-                        logging.error("Error: Invalid radar sensor data received.")
             time.sleep(0.1)  # Sleep briefly to avoid busy waiting
     except KeyboardInterrupt:
         logging.info("Exiting...")
     finally:
         ser.close()  # Ensure the serial port is closed on exit
 
-def check_and_send_request(distance):
+def read_from_soft_uart():
+
+    RX_GPIO = 17      # BCM GPIO17 → physical pin 11
+    BAUD = 9600
+
+    pi = pigpio.pi()
+    if not pi.connected:
+        logging.error("pigpio daemon not running")
+        return
+
+    pi.set_mode(RX_GPIO, pigpio.INPUT)
+    pi.bb_serial_read_open(RX_GPIO, BAUD)
+
+    logging.info("Software UART radar started")
+
+    try:
+        while True:
+            count, data = pi.bb_serial_read(RX_GPIO)
+            if count > 0:
+                decoded = data.decode("utf-8", errors="ignore")
+                numeric = ''.join(filter(str.isdigit, decoded))
+                if numeric:
+                    distance = float(numeric)
+                    logging.info(f"RADAR_2 | Soft UART Radar: {distance} cm")
+                    check_and_send_request(distance, "RADAR_2", "Software_UART")
+            time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pi.bb_serial_read_close(RX_GPIO)
+        pi.stop()
+
+def check_and_send_request(distance, sensor_id, sensor_type):
     if VALID_RANGE_MIN <= distance <= VALID_RANGE_MAX:
         data = {
             "cameraId": "RD001",
             "eventTime": int(time.time()),
             "timeStampStr": time.strftime("%Y-%m-%d %H:%M:%S"),
             "eventType": "Sensor_Event",
-            "eventTag": "distance"
+            "eventTag": "distance",
+            "sensorId": sensor_id,
+            "sensorType": sensor_type
         }
+        
         headers = {'Content-Type': 'application/json'}
         response = send_http_command(SERVER_URL, method='POST', data=json.dumps(data), headers=headers)
         if response:
-            logging.info(f"HTTP Response: {response}")
+            logging.info(f"{sensor_id} ({sensor_type}) | HTTP Response: {response}")
         else:
-            logging.error("Failed to send HTTP request.")
+            logging.error(f"{sensor_id} ({sensor_type}) | Failed to send HTTP request.")
     else:
-        logging.info(f"Distance {distance:.2f} cm is out of the valid range ({VALID_RANGE_MIN} - {VALID_RANGE_MAX} cm).")
+        logging.info(f"{sensor_id} ({sensor_type}) | Distance {distance:.2f} cm is out of the valid range ({VALID_RANGE_MIN} - {VALID_RANGE_MAX} cm).")
 
 def main():
-    try:
-        # Start the UART reading process in a separate thread
-        with serial.Serial(RADAR_PORT, baudrate=RADAR_BAUDRATE, timeout=1) as ser:
-            logging.info(f"Connected to {RADAR_PORT} at {RADAR_BAUDRATE} baud")
+    try: # Hardware UART radar
+        hw_ser = serial.Serial("/dev/serial0", baudrate=RADAR_BAUDRATE, timeout=1)
+        logging.info("Hardware UART radar connected on /dev/serial0")
 
-            # Thread to handle UART reading from radar sensor
-            read_thread = threading.Thread(target=read_from_port, args=(ser,))
-            read_thread.daemon = True
-            read_thread.start()
+        hw_thread = threading.Thread(target=read_from_port, args=(hw_ser,), daemon=True)
+        hw_thread.start()
 
-            while True:
-                # Ultrasonic Sensor
-                distance_ultrasonic = measure_distance_ultrasonic()
-                if distance_ultrasonic != -1:
-                    logging.info(f"Ultrasonic Sensor Distance: {distance_ultrasonic:.2f} cm")
-                    check_and_send_request(distance_ultrasonic)
+        # Software UART radar
+        sw_thread = threading.Thread(target=read_from_soft_uart, daemon=True)
+        sw_thread.start()
 
-                time.sleep(3)
+        # Start the ultrasonic sensor reading loop in the main thread
+        while True:
+            for sensor in ULTRASONIC_SENSORS:
+                distance = measure_distance_ultrasonic(sensor["trig"], sensor["echo"])
+                if distance != -1:
+                    logging.info(f"{sensor['id']} Ultrasonic Distance: {distance:.2f} cm")
+                    check_and_send_request(distance, sensor["id"], "Ultrasonic")
+            time.sleep(3)
 
     except KeyboardInterrupt:
         logging.info("Program interrupted by user.")
     finally:
+        try:
+            hw_ser.close()
+        except Exception:
+            pass
         GPIO.cleanup()
         logging.info("GPIO cleaned up. Exiting program.")
 
