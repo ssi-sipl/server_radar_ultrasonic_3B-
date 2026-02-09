@@ -27,7 +27,7 @@ RADAR_PORT = '/dev/ttyS0'  # Hardcoded serial port for radar sensor
 RADAR_BAUDRATE = 115200        # Hardcoded baud rate for radar sensor
 
 # Server configuration
-SERVER_URL = 'http://192.168.0.5:3300/analyticEvent'  # URL for testing on local server
+SERVER_URL = 'http://192.168.0.88:5000/api/alerts/from-nx'  # URL for testing on local server
 
 # Valid range for triggering HTTP requests
 VALID_RANGE_MIN = 120
@@ -131,26 +131,51 @@ def read_from_soft_uart():
         pi.bb_serial_read_close(RX_GPIO)
         pi.stop()
 
-def check_and_send_request(distance, sensor_id, sensor_type):
-    if VALID_RANGE_MIN <= distance <= VALID_RANGE_MAX:
-        data = {
-            "cameraId": "RD001",
-            "eventTime": int(time.time()),
-            "timeStampStr": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "eventType": "Sensor_Event",
-            "eventTag": "distance",
-            "sensorId": sensor_id,
-            "sensorType": sensor_type
+def check_and_send_request(distance_cm, sensor_id, sensor_type):
+
+    if VALID_RANGE_MIN <= distance_cm <= VALID_RANGE_MAX:
+
+        # Convert cm → meters
+        distance_m = distance_cm / 100.0
+
+        # Create formatted timestamp string
+        time_stamp_str = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Convert to microseconds
+        timestamp_seconds = int(
+            time.mktime(
+                time.strptime(time_stamp_str, "%Y-%m-%d %H:%M:%S")
+            )
+        )
+        timestamp_us = timestamp_seconds * 1_000_000
+
+        data_string = (
+            f"Type:nx.base.Sensor;"
+            f"distance:{distance_m};"
+            f"TimestampUs:{timestamp_us};"
+        )
+
+        payload = {
+            "sensorId": "ipcam1",
+            "data": data_string
         }
-        
+
         headers = {'Content-Type': 'application/json'}
-        response = send_http_command(SERVER_URL, method='POST', data=json.dumps(data), headers=headers)
-        if response:
-            logging.info(f"{sensor_id} ({sensor_type}) | HTTP Response: {response}")
-        else:
-            logging.error(f"{sensor_id} ({sensor_type}) | Failed to send HTTP request.")
+
+        try:
+            requests.post(SERVER_URL, json=payload, headers=headers)
+
+            logging.info(
+                f"{sensor_id} ({sensor_type}) → Sent NX event | {time_stamp_str}"
+            )
+
+        except Exception as e:
+            logging.error(f"HTTP Error: {e}")
+
     else:
-        logging.info(f"{sensor_id} ({sensor_type}) | Distance {distance:.2f} cm is out of the valid range ({VALID_RANGE_MIN} - {VALID_RANGE_MAX} cm).")
+        logging.info(
+            f"{sensor_id} ({sensor_type}) | Distance {distance_cm:.2f} cm out of range"
+        )
 
 def main():
     try: # Hardware UART radar
