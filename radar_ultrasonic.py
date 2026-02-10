@@ -13,6 +13,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # GPIO Configuration
 GPIO.setmode(GPIO.BOARD)
 
+#Enable / Logic-high pin
+ENABLE_PIN = 22
+GPIO.setup(ENABLE_PIN, GPIO.OUT)
+GPIO.output(ENABLE_PIN, GPIO.HIGH)
+
 ULTRASONIC_SENSORS = [                      # Hardcoded GPIO pin for trigger and echo for each ultrasonic sensor
     {"id": "US1", "trig": 23, "echo": 24},
     {"id": "US2", "trig": 15, "echo": 13},
@@ -98,37 +103,42 @@ def read_from_port(ser):
     finally:
         ser.close()  # Ensure the serial port is closed on exit
 
-def read_from_soft_uart():
+def read_from_soft_uart(rx_gpio, sensor_id):
 
-    RX_GPIO = 17      # BCM GPIO17 → physical pin 11
     BAUD = 9600
 
     pi = pigpio.pi()
     if not pi.connected:
-        logging.error("pigpio daemon not running")
+        logging.error(f"{sensor_id} pigpio not running")
         return
 
-    pi.set_mode(RX_GPIO, pigpio.INPUT)
-    pi.bb_serial_read_open(RX_GPIO, BAUD)
+    pi.set_mode(rx_gpio, pigpio.INPUT)
+    pi.bb_serial_read_open(rx_gpio, BAUD)
 
-    logging.info("Software UART radar started")
+    logging.info(f"Software UART radar started for sensor {sensor_id} on GPIO {rx_gpio}")
 
     try:
         while True:
             count, data = pi.bb_serial_read(RX_GPIO)
             if count > 0:
                 decoded = data.decode("utf-8", errors="ignore")
-                numeric = ''.join(filter(str.isdigit, decoded))
-                if numeric:
-                    distance = float(numeric)
-                    logging.info(f"RADAR_2 | Soft UART Radar: {distance} cm")
-                    check_and_send_request(distance, "RADAR_2", "Software_UART")
+                buffer +=  decoded
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line.isdigit():
+                        distance = int(line)
+                        if 10 <= distance <= 780:
+                            logging.info(f"{sensor_id} |Radar Sensor Value: {distance} cm")
+                            check_and_send_request(distance, sensor_id, "Software_UART")
+                        else:
+                            logging.info(f"{sensor_id} | Distance {distance:.2f} cm is out of the valid range (10 - 780 cm).")
             time.sleep(0.05)
 
     except KeyboardInterrupt:
         pass
     finally:
-        pi.bb_serial_read_close(RX_GPIO)
+        pi.bb_serial_read_close(rx_gpio)
         pi.stop()
 
 def check_and_send_request(distance_cm, sensor_id, sensor_type):
@@ -185,9 +195,22 @@ def main():
         hw_thread = threading.Thread(target=read_from_port, args=(hw_ser,), daemon=True)
         hw_thread.start()
 
-        # Software UART radar
-        sw_thread = threading.Thread(target=read_from_soft_uart, daemon=True)
-        sw_thread.start()
+        
+        # Software UART radar (RADAR_3); GPIO17 → Physical pin 11
+        sw_thread_1 = threading.Thread(
+            target=read_from_soft_uart,
+            args=(17, "RADAR_2"),
+            daemon=True
+        )
+        sw_thread_1.start()
+
+        # Software UART radar (RADAR_3); GPIO27 → Physical pin 13
+        sw_thread_2 = threading.Thread(
+            target=read_from_soft_uart,
+            args=(27, "RADAR_3"),
+            daemon=True
+        )
+        sw_thread_2.start()
 
         # Start the ultrasonic sensor reading loop in the main thread
         while True:
