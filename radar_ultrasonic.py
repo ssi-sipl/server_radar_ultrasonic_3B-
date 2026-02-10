@@ -13,11 +13,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # GPIO Configuration
 GPIO.setmode(GPIO.BOARD)
 
-#Enable / Logic-high pin
-ENABLE_PIN = 22
-GPIO.setup(ENABLE_PIN, GPIO.OUT)
-GPIO.output(ENABLE_PIN, GPIO.HIGH)
-
 ULTRASONIC_SENSORS = [                      # Hardcoded GPIO pin for trigger and echo for each ultrasonic sensor
     {"id": "US1", "trig": 23, "echo": 24},
     {"id": "US2", "trig": 15, "echo": 13},
@@ -32,7 +27,7 @@ RADAR_PORT = '/dev/ttyS0'  # Hardcoded serial port for radar sensor
 RADAR_BAUDRATE = 115200        # Hardcoded baud rate for radar sensor
 
 # Server configuration
-SERVER_URL = 'http://192.168.0.88:5000/api/alerts/from-nx'  # URL for testing on local server
+SERVER_URL = 'http://192.168.0.5:3300/analyticEvent'  # URL for testing on local server
 
 # Valid range for triggering HTTP requests
 VALID_RANGE_MIN = 120
@@ -103,89 +98,59 @@ def read_from_port(ser):
     finally:
         ser.close()  # Ensure the serial port is closed on exit
 
-def read_from_soft_uart(rx_gpio, sensor_id):
+def read_from_soft_uart():
 
+    RX_GPIO = 17      # BCM GPIO17 → physical pin 11
     BAUD = 9600
 
     pi = pigpio.pi()
     if not pi.connected:
-        logging.error(f"{sensor_id} pigpio not running")
+        logging.error("pigpio daemon not running")
         return
 
-    pi.set_mode(rx_gpio, pigpio.INPUT)
-    pi.bb_serial_read_open(rx_gpio, BAUD)
+    pi.set_mode(RX_GPIO, pigpio.INPUT)
+    pi.bb_serial_read_open(RX_GPIO, BAUD)
 
-    logging.info(f"Software UART radar started for sensor {sensor_id} on GPIO {rx_gpio}")
+    logging.info("Software UART radar started")
 
     try:
         while True:
             count, data = pi.bb_serial_read(RX_GPIO)
             if count > 0:
                 decoded = data.decode("utf-8", errors="ignore")
-                buffer +=  decoded
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if line.isdigit():
-                        distance = int(line)
-                        if 10 <= distance <= 780:
-                            logging.info(f"{sensor_id} |Radar Sensor Value: {distance} cm")
-                            check_and_send_request(distance, sensor_id, "Software_UART")
-                        else:
-                            logging.info(f"{sensor_id} | Distance {distance:.2f} cm is out of the valid range (10 - 780 cm).")
+                numeric = ''.join(filter(str.isdigit, decoded))
+                if numeric:
+                    distance = float(numeric)
+                    logging.info(f"RADAR_2 | Soft UART Radar: {distance} cm")
+                    check_and_send_request(distance, "RADAR_2", "Software_UART")
             time.sleep(0.05)
 
     except KeyboardInterrupt:
         pass
     finally:
-        pi.bb_serial_read_close(rx_gpio)
+        pi.bb_serial_read_close(RX_GPIO)
         pi.stop()
 
-def check_and_send_request(distance_cm, sensor_id, sensor_type):
-
-    if VALID_RANGE_MIN <= distance_cm <= VALID_RANGE_MAX:
-
-        # Convert cm → meters
-        distance_m = distance_cm / 100.0
-
-        # Create formatted timestamp string
-        time_stamp_str = time.strftime("%Y-%m-%d %H:%M:%S")
-
-        # Convert to microseconds
-        timestamp_seconds = int(
-            time.mktime(
-                time.strptime(time_stamp_str, "%Y-%m-%d %H:%M:%S")
-            )
-        )
-        timestamp_us = timestamp_seconds * 1_000_000
-
-        data_string = (
-            f"Type:nx.base.Sensor;"
-            f"distance:{distance_m};"
-            f"TimestampUs:{timestamp_us};"
-        )
-
-        payload = {
-            "sensorId": "ipcam1",
-            "data": data_string
+def check_and_send_request(distance, sensor_id, sensor_type):
+    if VALID_RANGE_MIN <= distance <= VALID_RANGE_MAX:
+        data = {
+            "cameraId": "RD001",
+            "eventTime": int(time.time()),
+            "timeStampStr": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "eventType": "Sensor_Event",
+            "eventTag": "distance",
+            "sensorId": sensor_id,
+            "sensorType": sensor_type
         }
-
+        
         headers = {'Content-Type': 'application/json'}
-
-        try:
-            requests.post(SERVER_URL, json=payload, headers=headers)
-
-            logging.info(
-                f"{sensor_id} ({sensor_type}) → Sent NX event | {time_stamp_str}"
-            )
-
-        except Exception as e:
-            logging.error(f"HTTP Error: {e}")
-
+        response = send_http_command(SERVER_URL, method='POST', data=json.dumps(data), headers=headers)
+        if response:
+            logging.info(f"{sensor_id} ({sensor_type}) | HTTP Response: {response}")
+        else:
+            logging.error(f"{sensor_id} ({sensor_type}) | Failed to send HTTP request.")
     else:
-        logging.info(
-            f"{sensor_id} ({sensor_type}) | Distance {distance_cm:.2f} cm out of range"
-        )
+        logging.info(f"{sensor_id} ({sensor_type}) | Distance {distance:.2f} cm is out of the valid range ({VALID_RANGE_MIN} - {VALID_RANGE_MAX} cm).")
 
 def main():
     try: # Hardware UART radar
@@ -195,22 +160,9 @@ def main():
         hw_thread = threading.Thread(target=read_from_port, args=(hw_ser,), daemon=True)
         hw_thread.start()
 
-        
-        # Software UART radar (RADAR_3); GPIO17 → Physical pin 11
-        sw_thread_1 = threading.Thread(
-            target=read_from_soft_uart,
-            args=(17, "RADAR_2"),
-            daemon=True
-        )
-        sw_thread_1.start()
-
-        # Software UART radar (RADAR_3); GPIO27 → Physical pin 13
-        sw_thread_2 = threading.Thread(
-            target=read_from_soft_uart,
-            args=(27, "RADAR_3"),
-            daemon=True
-        )
-        sw_thread_2.start()
+        # Software UART radar
+        sw_thread = threading.Thread(target=read_from_soft_uart, daemon=True)
+        sw_thread.start()
 
         # Start the ultrasonic sensor reading loop in the main thread
         while True:
