@@ -4,7 +4,7 @@ import sys
 
 # CONFIGURATION
 USER = "rudra"
-WORKING_DIR = "/home/rudra/server_radar_ultrasonic"
+WORKING_DIR = "/home/rudra/server_radar_ultrasonic_3B-"
 VENV_NAME = "rudrarakshak"
 PYTHON_SCRIPT = os.path.join(WORKING_DIR, "radar_ultrasonic.py")
 VENV_PATH = os.path.join(WORKING_DIR, VENV_NAME)
