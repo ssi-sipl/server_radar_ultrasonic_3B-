@@ -6,6 +6,7 @@ import serial
 import threading
 import logging
 import pigpio
+import sys
 
 pi = pigpio.pi()
 if not pi.connected:
@@ -47,11 +48,20 @@ RADAR_PORT = '/dev/ttyS0'  # Hardcoded serial port for radar sensor
 RADAR_BAUDRATE = 9600        # Hardcoded baud rate for radar sensor
 
 # Server configuration
-SERVER_URL = 'http://192.168.0.88:5000/api/alerts/from-nx'  # URL for testing on local server
+SERVER_URL = 'http://192.168.1.5:5000/api/alerts/from-nx'  # URL for testing on local server
 
 # Valid range for triggering HTTP requests
 VALID_RANGE_MIN = 120
 VALID_RANGE_MAX = 780
+
+# Read command-line arguments
+for arg in sys.argv:
+    if arg.startswith("sen_min="):
+        VALID_RANGE_MIN = int(arg.split("=")[1])
+    if arg.startswith("sen_max="):
+        VALID_RANGE_MAX = int(arg.split("=")[1])
+
+print(f"Sensor range set to: {VALID_RANGE_MIN} - {VALID_RANGE_MAX}")
 
 # Function to send HTTP command
 def send_http_command(url, method='POST', params=None, data=None, headers=None):
@@ -184,7 +194,7 @@ def check_and_send_request(distance_cm, sensor_id, sensor_type):
         )
 
         payload = {
-            "sensorId": "ipcam1",
+            "sensorId": "ipcam159",
             "data": data_string
         }
 
