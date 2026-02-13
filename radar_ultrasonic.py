@@ -17,6 +17,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # GPIO Configuration
 GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
 
 #Enable / Logic-high pin
 ENABLE_PIN = 15
@@ -50,18 +51,31 @@ RADAR_BAUDRATE = 9600        # Hardcoded baud rate for radar sensor
 # Server configuration
 SERVER_URL = 'http://192.168.1.5:5000/api/alerts/from-nx'  # URL for testing on local server
 
-# Valid range for triggering HTTP requests
-VALID_RANGE_MIN = 120
-VALID_RANGE_MAX = 780
+# Default sensor ranges (per sensor)
+SENSOR_RANGES = {
+    "US1": {"min": 120, "max": 780},
+    "US2": {"min": 120, "max": 780},
+    "RADAR_1": {"min": 120, "max": 780},
+    "RADAR_2": {"min": 120, "max": 780}
+}
 
-# Read command-line arguments
-for arg in sys.argv:
-    if arg.startswith("sen_min="):
-        VALID_RANGE_MIN = int(arg.split("=")[1])
-    if arg.startswith("sen_max="):
-        VALID_RANGE_MAX = int(arg.split("=")[1])
 
-print(f"Sensor range set to: {VALID_RANGE_MIN} - {VALID_RANGE_MAX}")
+# Read command-line arguments per sensor
+for arg in sys.argv[1:]:
+    if "=" in arg:
+        key, value = arg.split("=")
+
+        # Split only last underscore
+        if "_" in key:
+            sensor_name, limit_type = key.rsplit("_", 1)
+
+            if sensor_name in SENSOR_RANGES and limit_type in ["min", "max"]:
+                SENSOR_RANGES[sensor_name][limit_type] = int(value)
+
+print("Active Sensor Ranges:")
+for sensor, ranges in SENSOR_RANGES.items():
+    print(f"{sensor} -> {ranges['min']} - {ranges['max']}")
+
 
 # Function to send HTTP command
 def send_http_command(url, method='POST', params=None, data=None, headers=None):
@@ -171,7 +185,11 @@ def read_from_soft_uart(rx_gpio, tx_gpio, sensor_id):
 
 def check_and_send_request(distance_cm, sensor_id, sensor_type):
 
-    if VALID_RANGE_MIN <= distance_cm <= VALID_RANGE_MAX:
+    sensor_min = SENSOR_RANGES[sensor_id]["min"]
+    sensor_max = SENSOR_RANGES[sensor_id]["max"]
+
+    if sensor_min <= distance_cm <= sensor_max:
+
 
         # Convert cm → meters
         distance_m = distance_cm / 100.0
@@ -211,9 +229,11 @@ def check_and_send_request(distance_cm, sensor_id, sensor_type):
             logging.error(f"HTTP Error: {e}")
 
     else:
-        logging.info(
-            f"{sensor_id} ({sensor_type}) | Distance {distance_cm:.2f} cm out of range"
-        )
+            logging.info(
+                f"{sensor_id} ({sensor_type}) | Distance {distance_cm:.2f} cm "
+                f"out of range ({sensor_min}-{sensor_max})"
+            )
+
 
 def main():
     try: # Hardware UART radar
