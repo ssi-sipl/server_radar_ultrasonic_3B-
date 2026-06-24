@@ -1,0 +1,15 @@
+{
+    "sensorBoxId": "sensor_id",
+    "sensors": [
+        {
+            "sensorId": "RD001",
+            "min_range": "120",
+            "max_range": "720"
+        },
+        {
+            "sensorId": "US001",
+            "min_range": "120",
+            "max_range": "720"
+        }
+    ]
+}
