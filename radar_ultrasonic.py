@@ -202,7 +202,10 @@ def radar_worker(sensor_id):
 
         config = load_config()
 
-        sensor_config = config["sensors"].get(sensor_id, {})
+        sensor_config = next(
+            (s for s in config.get("sensors",[]) if s.get("sensorId") == sensor_id),
+            {}
+        )
 
         if not sensor_config.get("enabled", False):
 
@@ -301,10 +304,8 @@ def ultrasonic_worker(sensor_id):
 
         config = load_config()
 
-        sensor_config = config["sensors"].get(
-            sensor_id,
-            {}
-        )
+        sensor_config = next(
+        (s for s in config.get("sensors",[]) if s.get["sensorId"] == sensor_id),{})
 
         if not sensor_config.get(
             "enabled",
