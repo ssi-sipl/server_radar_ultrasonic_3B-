@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import json
 import logging
 import os
@@ -17,18 +18,23 @@ try:
 except ImportError:
     lgpio = None
 
-# AI Box URL - change the IP according to the AI Box IP address
+# --------------------------------------------------------------------------
+# Settings
+# --------------------------------------------------------------------------
 SERVER_URL = "http://192.168.1.100:5000/api/alerts/from-nx"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "sensors.json")
 LOG_FILE = os.path.join(BASE_DIR, "sensor_manager.log")
 
-COOLDOWN_SEC = 3      
-CONFIRM_READINGS = 2      
-RADAR_HOLD_SEC = 1.0    
-POWER_ACTIVE_LOW = True  
-DISPLAY_HZ = 10           
+POWER_ACTIVE_LOW = True
+DISPLAY_HZ = 20
+ULTRASONIC_CYCLE_SEC = 0.06
+CONFIG_CHECK_SEC = 0.5
+
+HTTP_TIMEOUT = (1.0, 2.0)
+HTTP_WORKERS = 2
+STALE_ALERT_SEC = 5.0
 
 SENSORS = {
     "RD001": {
@@ -47,21 +53,27 @@ SENSORS = {
 
 DEFAULT_CONFIG = {
     "sensorBoxId": "sensor1",
+    "cooldownSec": 3,
+    "confirmReadings": 2,
     "sensors": {
         "RD001": {
             "enabled": True, "min_range": 120, "max_range": 400,
-            "offset_cm": 0.0, "scale": 1.0,
+            "offset_cm": 0.0, "scale": 1.0, "smoothing": 1, "hold_sec": 0.5,
         },
         "US001": {
             "enabled": True, "min_range": 120, "max_range": 400,
             "offset_cm": 0.0, "scale": 1.0, "temperature_c": 25.0,
+            "smoothing": 3,
         },
     },
 }
 
-LG = None  
+LG = None
 
 
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
 class ConsoleHandler(logging.StreamHandler):
     def emit(self, record):
         try:
@@ -85,17 +97,27 @@ def setup_logging():
     root.addHandler(fh)
 
 
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
 class ConfigStore:
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
         self.mtime = None
+        self.last_check = -1e9
         self.data = json.loads(json.dumps(DEFAULT_CONFIG))
 
     @staticmethod
     def _normalize(raw):
-        """Accepts both {"sensors": {...}} and the old flat layout."""
-        cfg = {"sensorBoxId": raw.get("sensorBoxId", "sensor1"), "sensors": {}}
+        cfg = {
+            "sensorBoxId": raw.get("sensorBoxId", DEFAULT_CONFIG["sensorBoxId"]),
+            "cooldownSec": raw.get("cooldownSec", DEFAULT_CONFIG["cooldownSec"]),
+            "confirmReadings": raw.get(
+                "confirmReadings", DEFAULT_CONFIG["confirmReadings"]
+            ),
+            "sensors": {},
+        }
         src = raw.get("sensors")
         if not isinstance(src, dict):
             src = {k: v for k, v in raw.items() if isinstance(v, dict)}
@@ -106,7 +128,13 @@ class ConfigStore:
         return cfg
 
     def get(self):
+        now = time.monotonic()
+        if now - self.last_check < CONFIG_CHECK_SEC:
+            return self.data
         with self.lock:
+            if now - self.last_check < CONFIG_CHECK_SEC:
+                return self.data
+            self.last_check = now
             try:
                 if not os.path.exists(self.path):
                     with open(self.path, "w") as f:
@@ -124,6 +152,9 @@ class ConfigStore:
             return self.data
 
 
+# --------------------------------------------------------------------------
+# GPIO / power control
+# --------------------------------------------------------------------------
 def sensor_on(pin):
     GPIO.output(pin, GPIO.LOW if POWER_ACTIVE_LOW else GPIO.HIGH)
 
@@ -154,51 +185,67 @@ def setup_gpio():
     for s in SENSORS.values():
         GPIO.setup(s["power_pin"], GPIO.OUT)
         sensor_off(s["power_pin"])
-        # trig/echo are handled by lgpio when available, else by RPi.GPIO
         if s["type"] == "ultrasonic" and LG is None:
             GPIO.setup(s["trig"], GPIO.OUT, initial=GPIO.LOW)
             GPIO.setup(s["echo"], GPIO.IN)
 
-# HTTP communication (background thread, never blocks the sensors)
 
+# --------------------------------------------------------------------------
+# HTTP communication
+# --------------------------------------------------------------------------
 class HttpSender:
-    def __init__(self, url):
+    def __init__(self, url, workers=HTTP_WORKERS):
         self.url = url
-        self.session = requests.Session()
-        self.q = queue.Queue(maxsize=100)
+        self.q = queue.Queue(maxsize=50)
         self.running = True
-        self.thread = threading.Thread(target=self._worker, daemon=True, name="http")
+        self.threads = [
+            threading.Thread(target=self._worker, daemon=True, name=f"http{i}")
+            for i in range(workers)
+        ]
 
     def start(self):
-        self.thread.start()
+        for t in self.threads:
+            t.start()
 
     def stop(self):
         self.running = False
 
-    def enqueue(self, payload):
+    def enqueue(self, payload, sensor_id, t_detect):
         try:
-            self.q.put_nowait(payload)
+            self.q.put_nowait((payload, sensor_id, t_detect))
         except queue.Full:
             logging.error("Alert queue full - dropping alert")
 
     def _worker(self):
+        session = requests.Session()
         while self.running:
             try:
-                payload = self.q.get(timeout=0.5)
+                payload, sensor_id, t_detect = self.q.get(timeout=0.5)
             except queue.Empty:
                 continue
-            self.send_http_command(payload)
+            age = time.monotonic() - t_detect
+            if age > STALE_ALERT_SEC:
+                logging.warning(f"Dropped stale alert from {sensor_id} ({age:.1f}s old)")
+                continue
+            self.send_http_command(session, payload, sensor_id, t_detect)
 
-    def send_http_command(self, payload):
+    def send_http_command(self, session, payload, sensor_id, t_detect):
+        t0 = time.monotonic()
         try:
-            response = self.session.post(self.url, json=payload, timeout=5)
+            response = session.post(self.url, json=payload, timeout=HTTP_TIMEOUT)
             response.raise_for_status()
-            logging.info(f"Alert sent successfully ({payload['sensorId']})")
+            t1 = time.monotonic()
+            logging.info(
+                f"Alert sent successfully ({payload['sensorId']}) from {sensor_id}: "
+                f"http={(t1 - t0) * 1000:.0f}ms total={(t1 - t_detect) * 1000:.0f}ms"
+            )
         except Exception as e:
             logging.error(f"HTTP Error : {e}")
 
-# Alerts: debounce + cooldown, no blocking sleeps
 
+# --------------------------------------------------------------------------
+# Alerts
+# --------------------------------------------------------------------------
 class AlertManager:
     def __init__(self, cfgstore, sender):
         self.cfgstore = cfgstore
@@ -208,22 +255,22 @@ class AlertManager:
         self.last_alert = {}
 
     def update(self, sensor_id, in_range):
+        cfg = self.cfgstore.get()
         with self.lock:
             if not in_range:
                 self.hits[sensor_id] = 0
                 return
             self.hits[sensor_id] = self.hits.get(sensor_id, 0) + 1
-            if self.hits[sensor_id] < CONFIRM_READINGS:
+            if self.hits[sensor_id] < cfg["confirmReadings"]:
                 return
             now = time.monotonic()
-            if now - self.last_alert.get(sensor_id, -1e9) < COOLDOWN_SEC:
+            if now - self.last_alert.get(sensor_id, -1e9) < cfg["cooldownSec"]:
                 return
             self.last_alert[sensor_id] = now
-        self.send_alert(sensor_id)
+        self.send_alert(sensor_id, now, cfg["sensorBoxId"])
 
-    def send_alert(self, sensor_id):
+    def send_alert(self, sensor_id, t_detect, sensor_box_id):
         timestamp_us = int(time.time() * 1_000_000)
-        sensor_box_id = self.cfgstore.get()["sensorBoxId"]
         payload = {
             "sensorId": sensor_box_id,
             "data": (
@@ -232,17 +279,18 @@ class AlertManager:
             ),
         }
         logging.info(f"{sensor_id} DETECTED -> sending alert")
-        self.sender.enqueue(payload)
+        self.sender.enqueue(payload, sensor_id, t_detect)
 
 
+# --------------------------------------------------------------------------
 # Shared state, filter, calibration
-
+# --------------------------------------------------------------------------
 class SensorState:
     def __init__(self, sensor_id, kind):
         self.sensor_id = sensor_id
         self.kind = kind
-        self.distance = None   
-        self.raw = None          
+        self.distance = None
+        self.raw = None
         self.in_range = False
         self.status = "starting"
         self.stamps = deque(maxlen=20)
@@ -253,12 +301,21 @@ class SensorState:
         dt = self.stamps[-1] - self.stamps[0]
         return (len(self.stamps) - 1) / dt if dt > 0 else 0.0
 
+    def age_ms(self):
+        if not self.stamps:
+            return None
+        return (time.monotonic() - self.stamps[-1]) * 1000.0
+
 
 class RangeFilter:
-
-    def __init__(self, size=5, steady_cm=2.0):
-        self.window = deque(maxlen=size)
+    def __init__(self, size=3, steady_cm=2.0):
+        self.window = deque(maxlen=max(1, int(size)))
         self.steady_cm = steady_cm
+
+    def resize(self, size):
+        size = max(1, int(size))
+        if size != self.window.maxlen:
+            self.window = deque(self.window, maxlen=size)
 
     def clear(self):
         self.window.clear()
@@ -290,23 +347,21 @@ def publish(sensor_id, state, value, sensor_cfg, alerts, raw=None):
 
 
 def guarded(fn, sensor_id, *args):
-    """A crashing worker must be loud, never silent."""
     try:
         fn(sensor_id, *args)
     except Exception:
         logging.exception(f"Worker {sensor_id} crashed")
 
-# Ultrasonic
 
+# --------------------------------------------------------------------------
+# Ultrasonic
+# --------------------------------------------------------------------------
 def echo_to_cm(width_us, temp_c):
-    """Echo pulse width (us) -> distance (cm), corrected for temperature."""
     speed_m_s = 331.3 + 0.606 * temp_c
     return width_us * 1e-6 * speed_m_s * 100.0 / 2.0
 
 
 class LgpioRanger:
-    """Echo timed with kernel edge timestamps (nanoseconds) via lgpio."""
-
     def __init__(self, handle, trig, echo):
         self.h, self.trig, self.echo = handle, trig, echo
         self.rise = None
@@ -329,7 +384,7 @@ class LgpioRanger:
         self.width_us = None
         self.rise = None
         lgpio.gpio_write(self.h, self.trig, 1)
-        time.sleep(0.00002)               # >= 10 us trigger pulse
+        time.sleep(0.00002)
         lgpio.gpio_write(self.h, self.trig, 0)
         if not self.evt.wait(timeout):
             return None
@@ -345,8 +400,6 @@ class LgpioRanger:
 
 
 class GpioRanger:
-    """Software-timed fallback (less accurate: Python polling jitter)."""
-
     def __init__(self, trig, echo):
         self.trig, self.echo = trig, echo
 
@@ -381,7 +434,7 @@ def ultrasonic_worker(sensor_id, cfgstore, alerts, state, stop):
     else:
         ranger = GpioRanger(sensor["trig"], sensor["echo"])
 
-    flt = RangeFilter(size=5)
+    flt = RangeFilter(size=3)
     misses = 0
     powered = False
 
@@ -396,17 +449,18 @@ def ultrasonic_worker(sensor_id, cfgstore, alerts, state, stop):
                     flt.clear()
                     publish(sensor_id, state, None, sc, alerts)
                 state.status = "disabled"
-                stop.wait(1)
+                stop.wait(0.5)
                 continue
 
             if not powered:
                 sensor_on(sensor["power_pin"])
                 powered = True
                 state.status = "warming up"
-                stop.wait(1.0)
+                stop.wait(0.3)
                 state.status = "ok"
                 continue
 
+            t0 = time.perf_counter()
             width = ranger.measure_us()
             raw = None
             if width is not None:
@@ -421,121 +475,135 @@ def ultrasonic_worker(sensor_id, cfgstore, alerts, state, stop):
                     publish(sensor_id, state, None, sc, alerts)
             else:
                 misses = 0
+                flt.resize(sc.get("smoothing", 3))
                 value = flt.update(calibrate(raw, sc))
                 publish(sensor_id, state, value, sc, alerts, raw=raw)
 
-            stop.wait(0.06)   # HC-SR04 needs >= 60 ms between pings
+            elapsed = time.perf_counter() - t0
+            stop.wait(max(0.0, ULTRASONIC_CYCLE_SEC - elapsed))
     finally:
         ranger.close()
         sensor_off(sensor["power_pin"])
 
 
 # --------------------------------------------------------------------------
-# Radar (text lines such as "Range 123")
+# Radar
 # --------------------------------------------------------------------------
-RANGE_RE = re.compile(r"Range\D*(-?\d+(?:\.\d+)?)")
+RANGE_RE = re.compile(rb"Range[^\d\-]*(-?\d+(?:\.\d+)?)(?=[^\d.])")
 
 
 def radar_worker(sensor_id, cfgstore, alerts, state, stop):
     sensor = SENSORS[sensor_id]
     logging.info(f"Radar worker started ({sensor_id})")
-    flt = RangeFilter(size=3)
+    flt = RangeFilter(size=1)
     powered = False
     ser = None
+    buf = bytearray()
     last_rx = time.monotonic()
     last_range = 0.0
     last_warn = 0.0
 
-    while not stop.is_set():
-        sc = cfgstore.get()["sensors"][sensor_id]
+    try:
+        while not stop.is_set():
+            sc = cfgstore.get()["sensors"][sensor_id]
 
-        if not sc.get("enabled", False):
-            if ser:
-                ser.close()
-                ser = None
-            if powered:
-                sensor_off(sensor["power_pin"])
-                powered = False
-                flt.clear()
-                publish(sensor_id, state, None, sc, alerts)
-            state.status = "disabled"
-            stop.wait(1)
-            continue
-
-        if not powered:
-            sensor_on(sensor["power_pin"])
-            powered = True
-            state.status = "warming up"
-            stop.wait(2.0)
-
-        if ser is None:
-            try:
-                ser = serial.Serial(sensor["uart"], sensor["baudrate"], timeout=0.5)
-                ser.reset_input_buffer()
-                last_rx = time.monotonic()
-                state.status = "ok"
-                logging.info(f"{sensor_id} connected on {sensor['uart']}")
-            except Exception as e:
-                state.status = "port error"
-                logging.error(f"{sensor_id} cannot open {sensor['uart']}: {e}")
-                stop.wait(3)
+            if not sc.get("enabled", False):
+                if ser:
+                    ser.close()
+                    ser = None
+                buf.clear()
+                if powered:
+                    sensor_off(sensor["power_pin"])
+                    powered = False
+                    flt.clear()
+                    publish(sensor_id, state, None, sc, alerts)
+                state.status = "disabled"
+                stop.wait(0.5)
                 continue
 
-        try:
-            # If we ever fall behind, drop stale data so values stay real-time
-            if ser.in_waiting > 1024:
-                ser.reset_input_buffer()
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-        except Exception as e:
-            logging.error(f"{sensor_id} read error: {e}")
+            if not powered:
+                sensor_on(sensor["power_pin"])
+                powered = True
+                state.status = "waiting"
+
+            if ser is None:
+                try:
+                    ser = serial.Serial(sensor["uart"], sensor["baudrate"], timeout=0.05)
+                    ser.reset_input_buffer()
+                    buf.clear()
+                    last_rx = time.monotonic()
+                    state.status = "waiting"
+                    logging.info(f"{sensor_id} connected on {sensor['uart']}")
+                except Exception as e:
+                    state.status = "port error"
+                    logging.error(f"{sensor_id} cannot open {sensor['uart']}: {e}")
+                    stop.wait(2)
+                    continue
+
             try:
-                ser.close()
-            except Exception:
-                pass
-            ser = None
-            state.status = "port error"
-            stop.wait(1)
-            continue
+                n = ser.in_waiting
+                chunk = ser.read(n if n else 1)
+            except Exception as e:
+                logging.error(f"{sensor_id} read error: {e}")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                state.status = "port error"
+                stop.wait(1)
+                continue
 
-        now = time.monotonic()
+            now = time.monotonic()
 
-        # Target gone: no Range line for a while -> treat as clear
-        if state.distance is not None and now - last_range > RADAR_HOLD_SEC:
-            flt.clear()
-            publish(sensor_id, state, None, sc, alerts)
+            if chunk:
+                last_rx = now
+                state.status = "ok"
+                buf += chunk
 
-        if not line:
-            if now - last_rx > 5 and now - last_warn > 5:
+                values = []
+                last_end = 0
+                for m in RANGE_RE.finditer(buf):
+                    values.append(float(m.group(1).decode()))
+                    last_end = m.end()
+                if last_end:
+                    del buf[:last_end]
+                elif len(buf) > 512:
+                    del buf[:-128]
+
+                flt.resize(sc.get("smoothing", 1))
+                for raw in values[-5:]:
+                    last_range = now
+                    value = flt.update(calibrate(raw, sc))
+                    publish(sensor_id, state, value, sc, alerts, raw=raw)
+            elif now - last_rx > 5 and now - last_warn > 5:
                 state.status = "no data"
                 last_warn = now
                 logging.warning(
                     f"{sensor_id}: no data for 5s - check power pin, TX/RX wiring, baud rate"
                 )
-            continue
 
-        last_rx = now
-        match = RANGE_RE.search(line)
-        if match:
-            state.status = "ok"
-            last_range = now
-            raw = float(match.group(1))
-            value = flt.update(calibrate(raw, sc))
-            publish(sensor_id, state, value, sc, alerts, raw=raw)
-
-    if ser:
-        ser.close()
-    sensor_off(sensor["power_pin"])
+            if state.distance is not None and now - last_range > sc.get("hold_sec", 0.5):
+                flt.clear()
+                publish(sensor_id, state, None, sc, alerts)
+    finally:
+        if ser:
+            ser.close()
+        sensor_off(sensor["power_pin"])
 
 
+# --------------------------------------------------------------------------
 # Terminal display
+# --------------------------------------------------------------------------
 def format_state(s):
     if s.status != "ok":
         text = f"({s.status})"
     elif s.distance is None:
         text = "-- clear"
     else:
+        age = s.age_ms() or 0.0
         raw = f"{s.raw:6.1f}" if s.raw is not None else "   -- "
-        text = f"{s.distance:6.1f}cm raw{raw} {s.rate():4.1f}Hz"
+        text = f"{s.distance:6.1f}cm raw{raw} {s.rate():3.0f}Hz {age:3.0f}ms"
         if s.in_range:
             text += " ALERT"
     return f"{s.sensor_id} {text}".ljust(40)
@@ -548,8 +616,9 @@ def display_loop(states, stop):
         stop.wait(1.0 / DISPLAY_HZ)
 
 
+# --------------------------------------------------------------------------
 # Main
-
+# --------------------------------------------------------------------------
 def main():
     global LG
     setup_logging()
