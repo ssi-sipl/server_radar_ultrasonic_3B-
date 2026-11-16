@@ -2,7 +2,6 @@
 import json
 import logging
 import os
-import queue
 import re
 import statistics
 import threading
@@ -21,7 +20,9 @@ except ImportError:
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
-SERVER_URL = "http://192.168.1.100:5000/api/alerts/from-nx"
+SERVER_URL = "http://192.168.1.5:5000/api/alerts/from-nx"
+DETECTION_TYPE = "nx.base.Detection"
+CONFIDENCE = 0.763411
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "sensors.json")
@@ -31,10 +32,6 @@ POWER_ACTIVE_LOW = True
 DISPLAY_HZ = 20
 ULTRASONIC_CYCLE_SEC = 0.06
 CONFIG_CHECK_SEC = 0.5
-
-HTTP_TIMEOUT = (1.0, 2.0)
-HTTP_WORKERS = 2
-STALE_ALERT_SEC = 5.0
 
 SENSORS = {
     "RD001": {
@@ -52,7 +49,7 @@ SENSORS = {
 }
 
 DEFAULT_CONFIG = {
-    "sensorBoxId": "sensor1",
+    "sensorBoxId": "CM029",
     "cooldownSec": 3,
     "confirmReadings": 2,
     "sensors": {
@@ -146,7 +143,15 @@ class ConfigStore:
                         raw = json.load(f)
                     self.data = self._normalize(raw)
                     self.mtime = mtime
-                    logging.info("Configuration loaded")
+                    if "sensorBoxId" not in raw:
+                        logging.warning(
+                            f"'sensorBoxId' not found in {self.path} - "
+                            f"using default '{self.data['sensorBoxId']}'"
+                        )
+                    logging.info(
+                        f"Configuration loaded from {self.path} "
+                        f"(sensorBoxId={self.data['sensorBoxId']})"
+                    )
             except Exception as e:
                 logging.error(f"Config error, keeping previous settings: {e}")
             return self.data
@@ -191,95 +196,48 @@ def setup_gpio():
 
 
 # --------------------------------------------------------------------------
-# HTTP communication
-# --------------------------------------------------------------------------
-class HttpSender:
-    def __init__(self, url, workers=HTTP_WORKERS):
-        self.url = url
-        self.q = queue.Queue(maxsize=50)
-        self.running = True
-        self.threads = [
-            threading.Thread(target=self._worker, daemon=True, name=f"http{i}")
-            for i in range(workers)
-        ]
-
-    def start(self):
-        for t in self.threads:
-            t.start()
-
-    def stop(self):
-        self.running = False
-
-    def enqueue(self, payload, sensor_id, t_detect):
-        try:
-            self.q.put_nowait((payload, sensor_id, t_detect))
-        except queue.Full:
-            logging.error("Alert queue full - dropping alert")
-
-    def _worker(self):
-        session = requests.Session()
-        while self.running:
-            try:
-                payload, sensor_id, t_detect = self.q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            age = time.monotonic() - t_detect
-            if age > STALE_ALERT_SEC:
-                logging.warning(f"Dropped stale alert from {sensor_id} ({age:.1f}s old)")
-                continue
-            self.send_http_command(session, payload, sensor_id, t_detect)
-
-    def send_http_command(self, session, payload, sensor_id, t_detect):
-        t0 = time.monotonic()
-        try:
-            response = session.post(self.url, json=payload, timeout=HTTP_TIMEOUT)
-            response.raise_for_status()
-            t1 = time.monotonic()
-            logging.info(
-                f"Alert sent successfully ({payload['sensorId']}) from {sensor_id}: "
-                f"http={(t1 - t0) * 1000:.0f}ms total={(t1 - t_detect) * 1000:.0f}ms"
-            )
-        except Exception as e:
-            logging.error(f"HTTP Error : {e}")
-
-
-# --------------------------------------------------------------------------
 # Alerts
 # --------------------------------------------------------------------------
+def send_http_command(payload):
+    try:
+        response = requests.post(SERVER_URL, json=payload, timeout=3)
+        response.raise_for_status()
+        logging.info(f"Alert sent successfully ({payload['sensorId']})")
+    except requests.HTTPError as e:
+        logging.error(f"HTTP Error : {e} | server said: {e.response.text[:200]!r}")
+    except Exception as e:
+        logging.error(f"HTTP Error : {e}")
+
+
+def send_alert(sensor_id, sensor_box_id):
+    timestamp_us = int(time.time() * 1_000_000)
+    payload = {
+        "sensorId": sensor_box_id,
+        "data": f"Type:{DETECTION_TYPE};Confidence:{CONFIDENCE};TimestampUs:{timestamp_us};",
+    }
+    logging.info(f"{sensor_id} DETECTED -> sending alert as {sensor_box_id}")
+    threading.Thread(target=send_http_command, args=(payload,), daemon=True).start()
+
+
 class AlertManager:
-    def __init__(self, cfgstore, sender):
+    def __init__(self, cfgstore):
         self.cfgstore = cfgstore
-        self.sender = sender
-        self.lock = threading.Lock()
         self.hits = {}
         self.last_alert = {}
 
     def update(self, sensor_id, in_range):
         cfg = self.cfgstore.get()
-        with self.lock:
-            if not in_range:
-                self.hits[sensor_id] = 0
-                return
-            self.hits[sensor_id] = self.hits.get(sensor_id, 0) + 1
-            if self.hits[sensor_id] < cfg["confirmReadings"]:
-                return
-            now = time.monotonic()
-            if now - self.last_alert.get(sensor_id, -1e9) < cfg["cooldownSec"]:
-                return
-            self.last_alert[sensor_id] = now
-        self.send_alert(sensor_id, now, cfg["sensorBoxId"])
-
-    def send_alert(self, sensor_id, t_detect, sensor_box_id):
-        timestamp_us = int(time.time() * 1_000_000)
-        payload = {
-            "sensorId": sensor_box_id,
-            "data": (
-                f"Type:nx.base.Detection;Confidence:0.72;"
-                f"TimestampUs:{timestamp_us};"
-            ),
-        }
-        logging.info(f"{sensor_id} DETECTED -> sending alert")
-        self.sender.enqueue(payload, sensor_id, t_detect)
+        if not in_range:
+            self.hits[sensor_id] = 0
+            return
+        self.hits[sensor_id] = self.hits.get(sensor_id, 0) + 1
+        if self.hits[sensor_id] < cfg["confirmReadings"]:
+            return
+        now = time.monotonic()
+        if now - self.last_alert.get(sensor_id, -1e9) < cfg["cooldownSec"]:
+            return
+        self.last_alert[sensor_id] = now
+        send_alert(sensor_id, cfg["sensorBoxId"])
 
 
 # --------------------------------------------------------------------------
@@ -629,9 +587,7 @@ def main():
     LG = open_lgpio()
     setup_gpio()
 
-    sender = HttpSender(SERVER_URL)
-    sender.start()
-    alerts = AlertManager(cfgstore, sender)
+    alerts = AlertManager(cfgstore)
 
     stop = threading.Event()
     states, threads = [], []
@@ -659,7 +615,6 @@ def main():
         stop.set()
         for t in threads:
             t.join(timeout=2)
-        sender.stop()
         for s in SENSORS.values():
             sensor_off(s["power_pin"])
         GPIO.cleanup()
